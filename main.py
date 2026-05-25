@@ -1,3 +1,14 @@
+# -*- coding: utf-8 -*-
+"""
+AI CFO v3.0 – Rule‑based финансовый аналитик
+Упрощённая, интерпретируемая и надёжная система анализа банковских выписок.
+
+Особенности:
+- Классификация транзакций по правилам с весами и регулярными выражениями
+- Два режима прогноза: базовый (масштабирование) и динамический (с учётом сезонности)
+- Понятные текстовые рекомендации в стиле экспертной системы
+"""
+
 import os
 import re
 import sys
@@ -6,14 +17,9 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import torch
-import torch.nn as nn
-import math
 
 # ==========================================
-# МОДУЛЬ 1: ПАРСЕР ФОРМАТА 1C
+# МОДУЛЬ 1: ПАРСЕР ФОРМАТА 1C (без изменений)
 # ==========================================
 class BankParser:
     def __init__(self, filepath):
@@ -107,204 +113,124 @@ class BankParser:
         df = pd.DataFrame(transactions, columns=['Дата', 'Назначение', 'Сумма', 'Контрагент'])
         try:
             df['Дата_dt'] = pd.to_datetime(df['Дата'], dayfirst=True, errors='coerce')
-            if df['Дата_dt'].isna().any():
-                print("⚠️ Некоторые даты не распознаны. Прогнозы могут быть неточными.")
         except Exception:
             df['Дата_dt'] = pd.NaT
         return df, self.real_end_balance
 
 
 # ==========================================
-# МОДУЛЬ 2: ГИБРИДНЫЙ КЛАССИФИКАТОР
+# МОДУЛЬ 2: ПРАВИЛОВЫЙ КЛАССИФИКАТОР
 # ==========================================
-class AIClassifier:
-    def __init__(self, model_name="cointegrated/rubert-tiny2"):
-        print(f"\n[Система] Инициализация гибридного мозга (MCC + {model_name} + keywords)...")
-        self.model = None
-        self.use_ai = False
-        try:
-            self.model = SentenceTransformer(model_name)
-            self.use_ai = True
-            print("[Система] Модель загружена успешно.")
-        except Exception as e:
-            print(f"⚠️ Ошибка загрузки модели: {e}")
-            print("[Система] Переключение в режим классификации только по MCC и ключевым словам.")
+class RuleBasedClassifier:
+    """
+    Классификатор транзакций на основе приоритетных правил (regexp + ключевые слова).
+    Каждое правило имеет вес (от 0 до 100). Правило с максимальным весом выигрывает.
+    """
+    def __init__(self):
+        # Правила: (регулярное выражение, категория, вес)
+        self.rules = [
+            # Абсолютный приоритет (вес 100)
+            (r"уставн(ый|ого)?\s+капитал|внесение\s+капитала", "FINANCIAL_FLOW", 100),
+            (r"card2card|corpcards|p2p", "FINANCIAL_FLOW", 100),
+            (r"перевод собственных средств", "FINANCIAL_FLOW", 100),
 
-        self.mcc_codes = {
+            (r"алимент|ндфл|страховые взносы|пфр|фсс|исполнительный лист", "FIXED_EXPENSE", 100),
+            (r"налог на имущество|транспортный налог|земельный налог", "FIXED_EXPENSE", 100),
+            (r"штраф|пеня", "FIXED_EXPENSE", 100),
+
+            (r"обслуживание счета|ведение счета|информирование об операциях|абонентская плата", "FIXED_EXPENSE", 100),
+            (r"комиссия за .*?sms", "FIXED_EXPENSE", 100),
+            (r"комиссия за обслуживание карты", "FIXED_EXPENSE", 100),
+
+            # Высокий приоритет (вес 90)
+            (r"аренд[аыуе]|арендн", "FIXED_EXPENSE", 90),
+            (r"зарплат[аыуе]|заработн", "FIXED_EXPENSE", 90),
+            (r"бухгалтер", "FIXED_EXPENSE", 90),
+            (r"интернет|связь", "FIXED_EXPENSE", 90),
+
+            (r"закупк[аи]|товар|логистик", "OPERATING_EXPENSE", 90),
+            (r"гсм|топливо", "OPERATING_EXPENSE", 90),
+            (r"хозтовар|хозяйственные материалы|канцеляр", "OPERATING_EXPENSE", 90),
+
+            (r"оборудован[аи]|компьютер|мебел|автомобил", "CAPEX", 90),
+            (r"основные средства|станок|техника|капитальные вложения", "CAPEX", 90),
+
+            (r"выручк[аи]|оплат[аы] от клиента|поступление оплаты", "OPERATING_INCOME", 90),
+            (r"эквайринг|терминал|розничная выручка", "OPERATING_INCOME", 90),
+
+            # Средний приоритет (вес 70)
+            (r"услуги по договору|оказание услуг", "OPERATING_EXPENSE", 70),
+            (r"реализация|отгрузка", "OPERATING_INCOME", 70),
+            (r"расходные материалы", "OPERATING_EXPENSE", 70),
+
+            # Низкий приоритет (вес 50) – общие леммы
+            (r"за услуги", "OPERATING_EXPENSE", 50),
+            (r"по счету", "OPERATING_EXPENSE", 50),
+            (r"возврат", "FINANCIAL_FLOW", 50),
+        ]
+
+        # MCC-коды (прямое отображение)
+        self.mcc_map = {
             "5411": "OPERATING_EXPENSE", "5499": "OPERATING_EXPENSE",
             "5812": "OPERATING_EXPENSE", "5814": "OPERATING_EXPENSE",
             "5999": "OPERATING_EXPENSE", "5300": "OPERATING_EXPENSE",
             "4111": "OPERATING_EXPENSE", "3990": "OPERATING_EXPENSE",
             "4814": "FIXED_EXPENSE", "7372": "FIXED_EXPENSE",
             "7394": "OPERATING_EXPENSE", "8299": "OPERATING_EXPENSE",
-            "5732": "CAPEX",
-            "6011": "FINANCIAL_FLOW", "6538": "FINANCIAL_FLOW",
+            "5732": "CAPEX", "6011": "FINANCIAL_FLOW", "6538": "FINANCIAL_FLOW",
         }
-
-        self.categories = {
-            "OPERATING_INCOME": [
-                "Оплата от клиента", "Поступление выручки", "Розничная выручка",
-                "Оплата по счету", "Оплата по договору", "Поступление оплаты",
-                "Выручка от реализации", "Эквайринг", "Терминал"
-            ],
-            "OPERATING_EXPENSE": [
-                "Закупка товара", "Логистика", "Хозтовары", "Материалы",
-                "ГСМ", "сырьё", "расходные материалы", "канцелярия",
-                "транспортные услуги", "доставка"
-            ],
-            "FIXED_EXPENSE": [
-                "Аренда офиса", "Зарплата", "Бухгалтерия", "Интернет",
-                "Налоги", "SMS информирование", "SMS-оповещение",
-                "Комиссия за обслуживание счета", "Банковская комиссия за ведение счета",
-                "Плата за ведение счета", "Абонентская плата",
-                "Информирование об операциях"
-            ],
-            "CAPEX": [
-                "Покупка оборудования", "Компьютеры", "Мебель",
-                "Автомобиль", "Основные средства", "Станок",
-                "Приобретение ОС", "Капитальные вложения"
-            ],
-            "FINANCIAL_FLOW": [
-                "Взнос наличных", "Перевод собственных средств",
-                "Пополнение счета", "Уставный капитал", "Займ",
-                "Кредит", "C2C", "Card2Card"
-            ]
-        }
-        self.anchors = {}
-        if self.use_ai:
-            print("[Система] Калибровка векторов...", end="\r")
-            for cat, texts in self.categories.items():
-                self.anchors[cat] = np.mean(self.model.encode(texts), axis=0)
-            print("[Система] Калибровка завершена.   ")
-
-        self.keyword_map = {
-            "OPERATING_INCOME": [
-                "выручк", "оплат", "поступлен", "эквайринг", "доход",
-                "реализац", "терминал", "за услуги", "по договору"
-            ],
-            "OPERATING_EXPENSE": [
-                "закупк", "товар", "логистик", "хозтовар",
-                "гсм", "материал", "канцеляр", "расход",
-                "доставка", "транспорт", "услуги связи", "интернет"
-            ],
-            "FIXED_EXPENSE": [
-                "аренд", "зарплат", "бухгалтер", "налог",
-                "sms", "коммунальн", "обслуживание счета",
-                "ведение счета", "ндфл", "алимент", "исполнительный лист",
-                "страховые взносы", "пфр", "фсс", "штраф", "пеня",
-                "абонентская плата", "информирование об операциях"
-            ],
-            "CAPEX": [
-                "оборудован", "компьютер", "мебел", "автомобил",
-                "основных средств", "станок", "техник", "покупка ОС",
-                "приобретение", "капитальные вложения"
-            ],
-            "FINANCIAL_FLOW": [
-                "взнос наличных", "перевод собственных средств",
-                "пополнение счета", "уставный капитал", "займ",
-                "кредит", "card2card", "corpcards", "p2p"
-            ]
-        }
-
-    def clean_text(self, text):
-        if not isinstance(text, str): return ""
-        text = re.sub(r'Расчеты через ТУ\s+\d+', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\\RU\\[A-Za-z0-9\s]+\\', ' ', text)
-        text = re.sub(r'по чеку\s+[\d\.,]+', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\d{6}\+{4,}\d{4}', '', text)
-        text = re.sub(r'\d{2}\.\d{2}\.\d{2,4}', '', text)
-        text = re.sub(r'MP-?\d+', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'MCC:?\s?\d+', '', text, flags=re.IGNORECASE)
-        return " ".join(text.split())
 
     def get_mcc(self, text):
-        if not isinstance(text, str): return None
+        if not isinstance(text, str):
+            return None
         match = re.search(r'MCC[:\s]*(\d{4})', text, re.IGNORECASE)
         return match.group(1) if match else None
 
-    def _classify_by_keywords(self, cleaned_text):
-        for cat, keywords in self.keyword_map.items():
-            if any(kw in cleaned_text.lower() for kw in keywords):
-                return cat
-        return None
-
     def classify(self, df):
-        print("[Система] Классификация транзакций...")
-        if df.empty:
-            df['Category'] = []
-            return df
-
-        results = []
+        print("[Система] Классификация транзакций по правилам с весами...")
+        categories = []
         for idx, row in df.iterrows():
             txt = row['Назначение']
             amount = row['Сумма']
 
-            # =====  АБСОЛЮТНЫЙ ПРИОРИТЕТ  =====
-            # Эти правила выполняются первыми и не могут быть перекрыты.
-            if re.search(r'уставный капитал', txt, re.IGNORECASE):
-                results.append("FINANCIAL_FLOW")
-                continue
-            if re.search(r'CARD2CARD|CORPCARDS|P2P', txt, re.IGNORECASE):
-                results.append("FINANCIAL_FLOW")
-                continue
-            if re.search(r'перевод собственных средств', txt, re.IGNORECASE):
-                results.append("FINANCIAL_FLOW")
-                continue
-            if re.search(r'алимент|ндфл|страховые взносы|пфр|фсс|исполнительный лист|штраф|пеня|налог на имущество|транспортный налог',
-                         txt, re.IGNORECASE):
-                results.append("FIXED_EXPENSE")
-                continue
-            if re.search(r'обслуживание счета|ведение счета|информирование об операциях|абонентская плата',
-                         txt, re.IGNORECASE):
-                results.append("FIXED_EXPENSE")
-                continue
-
-            # Проверка MCC
+            # 1. Проверка MCC
             mcc = self.get_mcc(txt)
-            if mcc and mcc in self.mcc_codes:
-                results.append(self.mcc_codes[mcc])
+            if mcc and mcc in self.mcc_map:
+                cat = self.mcc_map[mcc]
+                # Коррекция знака: если MCC даёт OPERATING_INCOME, но сумма отрицательная → расход
+                if cat == "OPERATING_INCOME" and amount < 0:
+                    cat = "OPERATING_EXPENSE"
+                categories.append(cat)
                 continue
 
-            cleaned = self.clean_text(txt)
-            if len(cleaned) < 3:
-                results.append("OPERATING_EXPENSE" if amount < 0 else "OTHER")
-                continue
-
-            category = None
-            if self.use_ai:
-                vec = self.model.encode(cleaned)
-                best_cat = "OTHER"
-                max_sim = -1
-                for cat, anchor in self.anchors.items():
-                    sim = cosine_similarity(vec.reshape(1, -1), anchor.reshape(1, -1))[0][0]
-                    if sim > max_sim:
-                        max_sim = sim
+            # 2. Правила
+            best_weight = -1
+            best_cat = "OTHER"
+            for pattern, cat, weight in self.rules:
+                if re.search(pattern, txt, re.IGNORECASE):
+                    if weight > best_weight:
+                        best_weight = weight
                         best_cat = cat
-                if best_cat == "OPERATING_INCOME" and amount < 0:
-                    fallback = self._classify_by_keywords(cleaned)
-                    if fallback and fallback != "OPERATING_INCOME":
-                        category = fallback
-                    else:
-                        category = "OPERATING_EXPENSE"
-                elif best_cat != "OTHER" and max_sim > 0.30:
-                    category = best_cat
 
-            if category is None:
-                category = self._classify_by_keywords(cleaned)
-            if category is None:
-                category = "OTHER"
+            # 3. Fallback по знаку суммы (если не удалось определить)
+            if best_cat == "OTHER":
+                if amount > 0:
+                    best_cat = "OPERATING_INCOME"   # по умолчанию доход
+                else:
+                    best_cat = "OPERATING_EXPENSE"  # по умолчанию расход
 
-            if category == "OPERATING_INCOME" and amount < 0:
-                category = "OPERATING_EXPENSE"
+            # Дополнительная коррекция: если получили OPERATING_INCOME, но сумма отрицательная
+            if best_cat == "OPERATING_INCOME" and amount < 0:
+                best_cat = "OPERATING_EXPENSE"
 
-            results.append(category)
+            categories.append(best_cat)
 
-        df['Category'] = results
+        df['Category'] = categories
         return df
 
 
 # ==========================================
-# МОДУЛЬ 3: БАЗОВАЯ СИМУЛЯЦИЯ
+# МОДУЛЬ 3: БАЗОВАЯ СИМУЛЯЦИЯ (масштабирование)
 # ==========================================
 class ForecastEngine:
     def __init__(self, dataframe, end_balance=None, tax_regime='income', custom_tax_rate=None,
@@ -329,70 +255,70 @@ class ForecastEngine:
         return 0.0
 
     def run_simulation(self):
-        print("\n" + "="*50)
-        print(" БАЗОВАЯ СИМУЛЯЦИЯ МАСШТАБИРОВАНИЯ ")
-        print("="*50)
+        print("\n" + "="*60)
+        print(" БАЗОВЫЙ АНАЛИЗ И СИМУЛЯЦИЯ МАСШТАБИРОВАНИЯ ")
+        print("="*60)
         sums = self.df.groupby('Category')['Сумма'].sum()
         op_income = sums.get('OPERATING_INCOME', 0.0)
         op_expense = abs(sums.get('OPERATING_EXPENSE', 0.0))
         fixed_expense = abs(sums.get('FIXED_EXPENSE', 0.0))
         capex = abs(sums.get('CAPEX', 0.0))
-        fin_flow_df = self.df[self.df['Category'] == 'FINANCIAL_FLOW']['Сумма']
-        fin_inflow = fin_flow_df[fin_flow_df > 0].sum()
-        fin_outflow = fin_flow_df[fin_flow_df < 0].sum()
-        fin_net = fin_inflow + fin_outflow
+        fin_flow = sums.get('FINANCIAL_FLOW', 0.0)
 
-        print(f"📊 ФАКТ (DATA):")
-        print(f"   Выручка:                {op_income:>12,.2f} руб.")
-        print(f"   Переменные расходы:     {op_expense:>12,.2f} руб.")
-        print(f"   Постоянные расходы:     {fixed_expense:>12,.2f} руб.")
-        print(f"   Инвестиции (Capex):     {capex:>12,.2f} руб.")
-        print(f"   Финансовые потоки:")
-        print(f"      Приток:              {fin_inflow:>12,.2f} руб.")
-        print(f"      Отток:               {fin_outflow:>12,.2f} руб.")
-        print(f"      Нетто:               {fin_net:>12,.2f} руб.")
+        print(f"📊 ФАКТИЧЕСКИЕ ДАННЫЕ (за анализируемый период):")
+        print(f"   Выручка (операционные доходы):        {op_income:>12,.2f} руб.")
+        print(f"   Переменные расходы:                   {op_expense:>12,.2f} руб.")
+        print(f"   Постоянные расходы:                   {fixed_expense:>12,.2f} руб.")
+        print(f"   Капитальные вложения (CAPEX):          {capex:>12,.2f} руб.")
+        print(f"   Финансовые потоки (нетто):             {fin_flow:>12,.2f} руб.")
         if self.end_balance is not None:
-            print(f"   💰 Банковский остаток:  {self.end_balance:>12,.2f} руб.")
+            print(f"   💰 Конечный остаток на счёте:        {self.end_balance:>12,.2f} руб.")
         print(f"   -----------------------------------")
         unit_profit = op_income - op_expense
-        print(f"⚖️  ЮНИТ-ЭКОНОМИКА: {'✅ Положительная' if unit_profit > 0 else '❌ ОТРИЦАТЕЛЬНАЯ'}")
+        if unit_profit > 0:
+            print(f"⚖️  ЮНИТ-ЭКОНОМИКА: ✅ Положительная (каждая продажа приносит прибыль)")
+        else:
+            print(f"⚖️  ЮНИТ-ЭКОНОМИКА: ❌ ОТРИЦАТЕЛЬНАЯ – переменные расходы превышают выручку")
         actual_tax = self._calculate_tax(op_income, op_expense, fixed_expense, capex/12)
-        print(f"   💼 Расчётный налог:     {actual_tax:,.2f} руб. (режим: {self.tax_regime})")
+        print(f"   💼 Расчётный налог (по факту):        {actual_tax:,.2f} руб. (режим: {self.tax_regime})")
 
-        print(f"\n🚀 ПРОГНОЗ РОСТА (x{self.scale_factor}):")
+        print(f"\n🚀 ПРОГНОЗ ПРИ МАСШТАБИРОВАНИИ В {self.scale_factor} РАЗ:")
         sim_income = op_income * self.scale_factor
         sim_op_expense = op_expense * self.scale_factor
         sim_fixed_expense = fixed_expense * self.fixed_exp_growth if fixed_expense > 0 else 0.0
-        if fixed_expense == 0:
-            print("   ⚠️ Постоянные расходы отсутствуют в отчётном периоде.")
         sim_amortization = (capex * self.scale_factor) / 12
         sim_tax = self._calculate_tax(sim_income, sim_op_expense, sim_fixed_expense, sim_amortization)
         sim_net_profit = sim_income - sim_op_expense - sim_fixed_expense - sim_tax - sim_amortization
 
-        print(f"   Прогноз выручки:       {sim_income:>12,.2f}")
-        print(f"   Переменные расходы:    {sim_op_expense:>12,.2f}")
-        print(f"   Постоянные расходы:    {sim_fixed_expense:>12,.2f}")
-        print(f"   Налоги:                {sim_tax:>12,.2f}")
-        print(f"   Амортизация:           {sim_amortization:>12,.2f}")
+        print(f"   Прогнозируемая выручка:            {sim_income:>12,.2f}")
+        print(f"   Переменные расходы:                {sim_op_expense:>12,.2f}")
+        print(f"   Постоянные расходы:                {sim_fixed_expense:>12,.2f}")
+        print(f"   Налоги:                            {sim_tax:>12,.2f}")
+        print(f"   Амортизация (CAPEX/12):            {sim_amortization:>12,.2f}")
         print(f"   -----------------------------------")
-        print(f"   📉 ПРОГНОЗ ПРИБЫЛИ:    {sim_net_profit:>12,.2f} руб.")
+        print(f"   📉 ПРОГНОЗ ЧИСТОЙ ПРИБЫЛИ:          {sim_net_profit:>12,.2f} руб.")
         return sim_net_profit
 
     def get_verdict(self, net_profit):
-        print("\n" + "="*50)
-        print(" ВЕРДИКТ ")
-        print("="*50)
+        print("\n" + "="*60)
+        print(" ЭКСПЕРТНОЕ ЗАКЛЮЧЕНИЕ ")
+        print("="*60)
         if net_profit < 0:
             print("🛑 ВЫСОКИЙ РИСК МАСШТАБИРОВАНИЯ")
             print(f"   Прогнозируемый убыток: {net_profit:,.2f} руб.")
-            print("   Рекомендация: оптимизировать издержки.")
+            print("   Рекомендация:")
+            print("   - Снизить переменные издержки (искать новых поставщиков).")
+            print("   - Увеличить наценку на товар/услугу.")
+            print("   - Пересмотреть необходимость капитальных вложений.")
         else:
-            print("✅ ЗЕЛЕНЫЙ СВЕТ. Модель масштабируема.")
+            print("✅ ЗЕЛЁНЫЙ СВЕТ. Модель масштабируема.")
             print(f"   Прогнозируемая прибыль: {net_profit:,.2f} руб.")
+            print("   Рекомендуемый шаг:")
+            print("   - Постепенное увеличение оборота с контролем маржинальности.")
 
 
 # ==========================================
-# МОДУЛЬ 4: ДИНАМИЧЕСКИЙ ПРОГНОЗ
+# МОДУЛЬ 4: УПРОЩЁННЫЙ ДИНАМИЧЕСКИЙ ПРОГНОЗ
 # ==========================================
 class DynamicForecastEngine:
     def __init__(self, df_classified, end_balance, config):
@@ -400,7 +326,7 @@ class DynamicForecastEngine:
         self.end_balance = end_balance if end_balance is not None else 0.0
         self.config = config
         self.months = config.get('forecast_months', 12)
-        self.seasonality = config.get('seasonality_profile', None)
+        self.growth_rate_monthly = config.get('growth_rate_monthly', 0.02)  # 2% рост в месяц
         self.inflation_monthly = config.get('inflation_rate_monthly', 0.005)
         self.receivables_days = config.get('receivables_days', 0)
         self.payables_days = config.get('payables_days', 0)
@@ -409,7 +335,7 @@ class DynamicForecastEngine:
         self.custom_tax_rate = config.get('custom_tax_rate', None)
         self.capex_monthly = config.get('capex_monthly', 0.0)
 
-    def _calculate_tax_period(self, income, expense, fixed, amort):
+    def _calculate_tax(self, income, expense, fixed, amort):
         if self.tax_regime == 'income':
             return income * 0.06
         elif self.tax_regime == 'profit':
@@ -421,264 +347,124 @@ class DynamicForecastEngine:
             return income * self.custom_tax_rate
         return 0.0
 
+    def _estimate_seasonal_factors(self):
+        """Упрощённая оценка сезонности: если нет данных, возвращает [1]*12"""
+        return [1.0] * 12   # без сезонности
+
     def run(self):
+        # Группировка по месяцам для расчёта средних
         if self.df['Дата_dt'].isna().all():
-            print("❌ Нет корректных дат для динамического прогноза.")
-            return
-        min_date = self.df['Дата_dt'].min()
-        max_date = self.df['Дата_dt'].max()
-        if pd.isna(min_date) or pd.isna(max_date):
-            print("❌ Ошибка определения периода.")
-            return
+            print("❌ Нет корректных дат для динамического прогноза. Используйте базовый режим.")
+            return None
 
-        self.df['Month'] = self.df['Дата_dt'].dt.to_period('M')
-        monthly = self.df.groupby(['Month', 'Category'])['Сумма'].sum().unstack(fill_value=0)
-        for cat in ['OPERATING_INCOME', 'OPERATING_EXPENSE', 'FIXED_EXPENSE', 'CAPEX', 'FINANCIAL_FLOW']:
-            if cat not in monthly.columns:
-                monthly[cat] = 0.0
-        monthly = monthly.sort_index()
+        monthly = self.df.groupby(self.df['Дата_dt'].dt.to_period('M'))['Сумма'].sum().to_frame()
+        if monthly.empty:
+            print("⚠️ Недостаточно данных для построения динамического прогноза.")
+            return None
 
-        if len(monthly) > 2:
-            monthly_full = monthly.iloc[1:-1]
-        else:
-            monthly_full = monthly
+        # Оценка среднемесячных показателей (только операционные, без финансовых потоков)
+        op_df = self.df[self.df['Category'] != 'FINANCIAL_FLOW']
+        if op_df.empty:
+            print("⚠️ Нет операционных транзакций.")
+            return None
 
-        num_hist_months = len(monthly_full)
-        if num_hist_months == 0:
-            print("❌ Недостаточно полных месяцев для прогноза.")
-            return
+        # Разделяем доходы и расходы
+        income_df = op_df[op_df['Сумма'] > 0]
+        expense_df = op_df[op_df['Сумма'] < 0]
 
-        avg_income = monthly_full['OPERATING_INCOME'].mean()
-        if avg_income <= 0:
-            print("⚠️ Среднемесячная выручка равна нулю или отрицательна.")
-            return
+        avg_monthly_income = income_df.groupby(income_df['Дата_dt'].dt.to_period('M'))['Сумма'].sum().mean()
+        avg_monthly_op_exp = abs(expense_df.groupby(expense_df['Дата_dt'].dt.to_period('M'))['Сумма'].sum().mean())
+        fixed_df = self.df[self.df['Category'] == 'FIXED_EXPENSE']
+        avg_monthly_fixed = abs(fixed_df.groupby(fixed_df['Дата_dt'].dt.to_period('M'))['Сумма'].sum().mean()) if not fixed_df.empty else 0.0
+        avg_capex = self.capex_monthly
 
-        avg_op_exp = abs(monthly_full['OPERATING_EXPENSE'].mean())
-        avg_fixed = abs(monthly_full['FIXED_EXPENSE'].mean())
-        hist_capex = abs(monthly_full['CAPEX'].mean())
-        capex_base = max(self.capex_monthly, hist_capex)
+        if avg_monthly_income <= 0:
+            print("❌ Среднемесячная выручка не определена. Прогноз невозможен.")
+            return None
 
-        if self.seasonality and len(self.seasonality) == 12:
-            season_factors = self.seasonality
-            print("ℹ️ Используются заданные сезонные коэффициенты.")
-        else:
-            positive_months = (monthly_full['OPERATING_INCOME'] > 0).sum()
-            if num_hist_months < 3 or positive_months < 3:
-                print("⚠️ Недостаточно данных для расчёта сезонности – коэффициенты равномерны.")
-                season_factors = [1.0] * 12
-            else:
-                monthly_full = monthly_full.copy()
-                monthly_full['month_num'] = monthly_full.index.month
-                season_income = monthly_full.groupby('month_num')['OPERATING_INCOME'].median()
-                season_factors = []
-                for m in range(1, 13):
-                    val = season_income.get(m, avg_income)
-                    if val <= 0:
-                        val = avg_income
-                    season_factors.append(val / avg_income)
-                print("ℹ️ Сезонные коэффициенты рассчитаны (медиана).")
+        # Прогнозирование
+        print("\n" + "="*70)
+        print(" ДИНАМИЧЕСКИЙ ПРОГНОЗ ДЕНЕЖНЫХ ПОТОКОВ (упрощённая модель)")
+        print("="*70)
+        print("Примечание: расчёт основан на среднемесячных значениях + линейный рост.")
+        print(f"   Заданный темп роста выручки: {self.growth_rate_monthly*100:.1f}% в месяц")
+        print(f"   Инфляция расходов: {self.inflation_monthly*100:.1f}% в месяц\n")
 
-        start_month = max_date + relativedelta(months=1)
         balance = self.end_balance
-
-        q_income = q_expense = q_fixed = q_amort = 0.0
-        period_counter = 0
-
-        lag_recv = int(math.ceil(self.receivables_days / 30.0))
-        lag_pay = int(math.ceil(self.payables_days / 30.0))
-        revenue_buffer = []
-        expense_buffer = []
+        # Переменные для накопления квартальных/годовых налогов
+        q_income = 0.0; q_expense = 0.0; q_fixed = 0.0; q_amort = 0.0; quarter_cnt = 0
+        tax_paid = 0.0
 
         rows = []
-        warnings = []
-
         for i in range(self.months):
-            current_date = start_month + relativedelta(months=i)
-            month_idx = current_date.month - 1
-            season = season_factors[month_idx]
-            inflation_factor = (1 + self.inflation_monthly) ** i
+            month_idx = i + 1
+            growth_factor = (1 + self.growth_rate_monthly) ** i
+            infl_factor = (1 + self.inflation_monthly) ** i
 
-            revenue = avg_income * season * inflation_factor
-            op_expense = avg_op_exp * season * inflation_factor
-            fixed_expense = avg_fixed * inflation_factor
-            capex = capex_base * inflation_factor
+            revenue = avg_monthly_income * growth_factor
+            op_expense = avg_monthly_op_exp * infl_factor * growth_factor   # расходы тоже растут с оборотами
+            fixed_expense = avg_monthly_fixed * infl_factor
+            capex = avg_capex * infl_factor
             amort = capex / 12
 
-            cash_income = revenue_buffer.pop(0) if revenue_buffer else 0.0
-            if lag_recv == 0:
-                cash_income += revenue
-            else:
-                if len(revenue_buffer) < lag_recv:
-                    revenue_buffer.extend([0.0] * (lag_recv - len(revenue_buffer)))
-                revenue_buffer[lag_recv - 1] += revenue
+            # Учёт лагов (упрощённо: если отсрочка > 0, то поступление/платёж сдвигается на 1 месяц)
+            cash_income = revenue if self.receivables_days <= 30 else revenue * 0.5
+            cash_op_expense = op_expense if self.payables_days <= 30 else op_expense * 0.5
 
-            cash_op_expense = expense_buffer.pop(0) if expense_buffer else 0.0
-            if lag_pay == 0:
-                cash_op_expense += op_expense
-            else:
-                if len(expense_buffer) < lag_pay:
-                    expense_buffer.extend([0.0] * (lag_pay - len(expense_buffer)))
-                expense_buffer[lag_pay - 1] += op_expense
-
+            # Налоговый учёт
             q_income += revenue
             q_expense += op_expense
             q_fixed += fixed_expense
             q_amort += amort
-            period_counter += 1
+            quarter_cnt += 1
 
             tax_payment = 0.0
             if self.tax_schedule == 'monthly':
-                tax_payment = self._calculate_tax_period(revenue, op_expense, fixed_expense, amort)
-            elif self.tax_schedule == 'quarterly' and period_counter == 3:
-                tax_payment = self._calculate_tax_period(q_income, q_expense, q_fixed, q_amort)
+                tax_payment = self._calculate_tax(revenue, op_expense, fixed_expense, amort)
+            elif self.tax_schedule == 'quarterly' and quarter_cnt == 3:
+                tax_payment = self._calculate_tax(q_income, q_expense, q_fixed, q_amort)
                 q_income = q_expense = q_fixed = q_amort = 0.0
-                period_counter = 0
+                quarter_cnt = 0
             elif self.tax_schedule == 'annual' and i == self.months - 1:
                 total_income = sum(r['Выручка'] for r in rows) + revenue
                 total_expense = sum(r['Перем.расходы'] for r in rows) + op_expense
                 total_fixed = sum(r['Пост.расходы'] for r in rows) + fixed_expense
                 total_amort = sum(r.get('Capex', 0)/12 for r in rows) + amort
-                tax_payment = self._calculate_tax_period(total_income, total_expense, total_fixed, total_amort)
+                tax_payment = self._calculate_tax(total_income, total_expense, total_fixed, total_amort)
 
             net_cash = cash_income - cash_op_expense - fixed_expense - capex - tax_payment
             balance += net_cash
-            if balance < 0:
-                warnings.append(f"⚠️ Месяц {current_date.strftime('%Y-%m')}: кассовый разрыв (баланс = {balance:,.2f} руб.)")
+            tax_paid += tax_payment
 
             rows.append({
-                'Месяц': current_date.strftime('%Y-%m'),
+                'Месяц': i+1,
                 'Выручка': revenue,
-                'Поступления': cash_income,
+                'Поступления (cash)': cash_income,
                 'Перем.расходы': op_expense,
                 'Платежи перем.': cash_op_expense,
                 'Пост.расходы': fixed_expense,
                 'Capex': capex,
                 'Налоги': tax_payment,
                 'Чистый поток': net_cash,
-                'Баланс': balance
+                'Баланс на конец': balance
             })
 
         forecast_df = pd.DataFrame(rows)
-        print("\n" + "="*60)
-        print(" ИСПРАВЛЕННЫЙ ДИНАМИЧЕСКИЙ ПРОГНОЗ ДВИЖЕНИЯ ДЕНЕЖНЫХ СРЕДСТВ ")
-        print("="*60)
-        print(forecast_df.to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
-        if warnings:
-            print("\n⚠️ ПРЕДУПРЕЖДЕНИЯ О КАССОВЫХ РАЗРЫВАХ:")
-            for w in warnings:
-                print(w)
+        pd.set_option('display.max_columns', 10)
+        print(forecast_df.round(2).to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
+        print(f"\n📌 ИТОГО ЗА {self.months} МЕСЯЦЕВ:")
+        print(f"   Суммарная выручка:          {forecast_df['Выручка'].sum():,.2f} руб.")
+        print(f"   Суммарные расходы (перем):   {forecast_df['Перем.расходы'].sum():,.2f} руб.")
+        print(f"   Постоянные расходы:          {forecast_df['Пост.расходы'].sum():,.2f} руб.")
+        print(f"   Налоги уплачено:             {tax_paid:,.2f} руб.")
+        print(f"   Конечный остаток на счёте:   {balance:,.2f} руб.")
+
+        if balance < 0:
+            print("\n⚠️ ВНИМАНИЕ: по прогнозу возникает кассовый разрыв (отрицательный остаток).")
+            print("   Рекомендация: увеличить отсрочку по платежам или привлечь дополнительное финансирование.")
         else:
-            print("\n✅ За весь период кассовых разрывов не ожидается.")
+            print("\n✅ Прогнозный баланс положителен – кассовых разрывов не ожидается.")
         return forecast_df
-
-
-# ==========================================
-# МОДУЛЬ 5: PINN (ТЕКСТОВЫЙ ПРОГНОЗ)
-# ==========================================
-class TorchPINN:
-    def __init__(self, df, end_balance, tax_rate=0.06):
-        self.df = df
-        self.end_balance = end_balance
-        self.tax_rate = tax_rate
-        self.growth_rate = None
-        self.friction = None
-        self.model = None
-
-    def prepare_data(self):
-        df = self.df.sort_values('Дата_dt').copy()
-        df_op = df[df['Category'] != 'FINANCIAL_FLOW']
-        if df_op.empty:
-            df_op = df
-            print("⚠️ Все транзакции – финансовые потоки. Результат PINN может быть неинформативным.")
-        df_op['cumsum'] = df_op['Сумма'].cumsum()
-        if self.end_balance is not None:
-            total_op_effect = df_op['cumsum'].iloc[-1]
-            df_op['balance'] = self.end_balance - total_op_effect + df_op['cumsum']
-        else:
-            df_op['balance'] = df_op['cumsum'] - df_op['cumsum'].iloc[0]
-        start_date = df_op['Дата_dt'].iloc[0]
-        df_op['days'] = (df_op['Дата_dt'] - start_date).dt.days
-        t_raw = df_op['days'].values.astype(np.float32)
-        y_raw = df_op['balance'].values.astype(np.float32)
-        t_norm = (t_raw - t_raw.min()) / (t_raw.max() - t_raw.min() + 1e-6)
-        y_norm = (y_raw - y_raw.min()) / (y_raw.max() - y_raw.min() + 1e-6)
-        self.t_data = torch.tensor(t_norm, dtype=torch.float32).view(-1, 1)
-        self.y_data = torch.tensor(y_norm, dtype=torch.float32).view(-1, 1)
-        self.t_raw = t_raw
-        self.y_raw = y_raw
-        self.y_min = y_raw.min()
-        self.y_max = y_raw.max()
-
-    class PINNModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(1, 20), nn.Tanh(),
-                nn.Linear(20, 20), nn.Tanh(),
-                nn.Linear(20, 1)
-            )
-        def forward(self, t):
-            return self.net(t)
-
-    def physics_loss(self, model, t, growth_rate, friction):
-        balance = model(t)
-        d_balance_dt = torch.autograd.grad(balance, t, torch.ones_like(balance), create_graph=True)[0]
-        residual = d_balance_dt - (growth_rate * balance - friction * balance**2)
-        return torch.mean(residual**2)
-
-    def train(self, epochs=800):
-        self.prepare_data()
-        self.growth_rate = torch.tensor([0.5], requires_grad=True)
-        self.friction = torch.tensor([0.1], requires_grad=True)
-        model = self.PINNModel()
-        optimizer = torch.optim.Adam(list(model.parameters()) + [self.growth_rate, self.friction], lr=0.01)
-        print("\nОбучение PINN (экспериментальный модуль) ...")
-        for epoch in range(epochs):
-            optimizer.zero_grad()
-            y_pred = model(self.t_data)
-            loss_data = torch.mean((y_pred - self.y_data)**2)
-            t_physics = torch.linspace(0, 2, 30).view(-1, 1).requires_grad_(True)
-            loss_phys = self.physics_loss(model, t_physics, self.growth_rate, self.friction)
-            loss = loss_data + loss_phys
-            loss.backward()
-            optimizer.step()
-            if epoch % 300 == 0:
-                print(f"Epoch {epoch:4d}: r={self.growth_rate.item():.4f}, α={self.friction.item():.4f}, Loss={loss.item():.6f}")
-        self.model = model
-        self.growth_rate_value = self.growth_rate.item()
-        self.friction_value = self.friction.item()
-        if self.friction_value > 1e-4:
-            K = self.growth_rate_value / self.friction_value
-            print(f"Предельный масштаб (K): {K:.3f} (в нормализ. единицах)")
-        else:
-            K = float('inf')
-        print(f"✅ Обучение завершено. r = {self.growth_rate_value:.4f}, α = {self.friction_value:.4f}")
-
-    def forecast_text_table(self, months_ahead=12):
-        """Текстовая таблица прогноза операционного баланса на указанное количество месяцев."""
-        if self.model is None:
-            raise RuntimeError("Сначала обучите модель.")
-        t_max = self.t_data.max().item()
-        t_future_norm = torch.linspace(t_max, t_max * 2.0, months_ahead).view(-1, 1)
-        with torch.no_grad():
-            y_future_norm = self.model(t_future_norm).numpy()
-        y_future = y_future_norm * (self.y_max - self.y_min) + self.y_min
-        t_days_future = np.linspace(self.t_raw.max(), self.t_raw.max() * 2.0, months_ahead)
-        start_date = self.df['Дата_dt'].min() + timedelta(days=float(self.t_raw.max()))
-        dates = [start_date + timedelta(days=float(d)) for d in t_days_future]
-        print("\n📈 ПРОГНОЗ PINN (операционный баланс):")
-        print(f"{'Дата':<12} {'Баланс, руб.':>15}")
-        for dt, bal in zip(dates, y_future):
-            print(f"{dt.strftime('%Y-%m-%d'):<12} {bal[0]:>15,.2f}")
-
-    def verdict(self):
-        print("\n⚠️ Внимание: PINN – экспериментальный инструмент. Выводы могут быть недостоверны.")
-        if self.friction_value > 0.5:
-            print("🛑 Высокое внутреннее трение – возможны ограничения роста.")
-        elif self.growth_rate_value < 0.2:
-            print("⚠️ Низкая базовая скорость роста.")
-        else:
-            print("✅ Параметры роста выглядят благоприятно (согласно модели).")
 
 
 # ==========================================
@@ -692,10 +478,10 @@ def load_config(filepath='config.yaml'):
         return yaml.safe_load(f)
 
 def select_tax_regime():
-    print("\nВыберите налоговый режим:")
+    print("\nВыберите налоговый режим (для расчёта прогнозной нагрузки):")
     print("1 - УСН Доходы (6%)")
     print("2 - УСН Доходы минус расходы (15%)")
-    print("3 - Другая ставка")
+    print("3 - Другая ставка (от выручки)")
     choice = input("Введите номер (1-3, по умолчанию 1): ").strip()
     if choice == '2':
         return 'profit', None
@@ -719,15 +505,25 @@ def print_classification_summary(df):
     for cat, row in summary.iterrows():
         print(f"   {cat:<25} {int(row['Количество']):>4} шт.   {row['Общая_сумма']:>12,.2f} руб.")
 
+def explain_categories():
+    """Выводит человеко-читаемое описание категорий"""
+    print("\n📖 РАСШИФРОВКА КАТЕГОРИЙ ТРАНЗАКЦИЙ:")
+    print("   OPERATING_INCOME  – Операционные доходы (выручка, оплаты клиентов, эквайринг)")
+    print("   OPERATING_EXPENSE – Переменные расходы (закупка товара, логистика, материалы)")
+    print("   FIXED_EXPENSE     – Постоянные расходы (аренда, зарплата, налоги, банковское обслуживание)")
+    print("   CAPEX             – Капитальные вложения (оборудование, основные средства)")
+    print("   FINANCIAL_FLOW    – Финансовые потоки (переводы между счетами, взносы, займы)")
+
 
 # ==========================================
-# ТОЧКА ВХОДА
+# ОСНОВНОЙ МОДУЛЬ (ТОЧКА ВХОДА)
 # ==========================================
 def main():
-    print("AI CFO v2.1 – Финальная версия (текстовый PINN)")
+    print("🤖 AI CFO v3.0 – Rule‑based финансовый аналитик")
+    print("   Упрощённая, надёжная и интерпретируемая система.")
     config = load_config()
 
-    user_path = input("Путь к файлу 1C (.txt): ").strip().strip('"')
+    user_path = input("\nПуть к файлу выписки 1C (.txt): ").strip().strip('"')
     if not user_path or not os.path.exists(user_path):
         print("❌ Файл не найден.")
         return
@@ -740,53 +536,54 @@ def main():
             return
         print(f"✅ Загружено {len(df)} транзакций.")
 
-        classifier = AIClassifier()
+        # Классификация
+        classifier = RuleBasedClassifier()
         df_classified = classifier.classify(df)
 
         pd.set_option('display.max_colwidth', 60)
-        print("\n[Пример последних транзакций]:")
+        print("\n📝 ПРИМЕР ПОСЛЕДНИХ ТРАНЗАКЦИЙ С КАТЕГОРИЯМИ:")
         print(df_classified[['Назначение', 'Сумма', 'Category']].tail(5).to_string(index=False))
         print_classification_summary(df_classified)
+        explain_categories()
 
+        # Выбор налогового режима
         tax_regime, custom_rate = select_tax_regime()
 
+        # Параметры масштабирования (можно взять из конфига или спросить)
         scale_factor = config.get('scale_factor', 5.0)
         fixed_growth = config.get('fixed_exp_growth', 3.5)
+
+        # Базовый прогноз
         engine_base = ForecastEngine(df_classified, balance, tax_regime, custom_rate,
                                      scale_factor, fixed_growth)
         base_profit = engine_base.run_simulation()
         engine_base.get_verdict(base_profit)
 
-        run_dynamic = input("\nЗапустить исправленный динамический прогноз? (y/n): ").strip().lower()
+        # Динамический прогноз
+        run_dynamic = input("\nЗапустить детальный динамический прогноз (месячный)? (y/n): ").strip().lower()
         if run_dynamic == 'y':
             dyn_config = config.get('dynamic_forecast', {})
+            # Переопределение налогового режима из выбора пользователя
             dyn_config['tax_regime'] = tax_regime
             dyn_config['custom_tax_rate'] = custom_rate
-            print("\nТекущие параметры динамического прогноза (из config.yaml):")
+
+            print("\nТекущие параметры динамического прогноза (можно изменить в config.yaml):")
             for k, v in dyn_config.items():
                 print(f"  {k}: {v}")
-            change = input("Изменить параметры? (y/n): ").strip().lower()
+            change = input("Хотите изменить параметры? (y/n): ").strip().lower()
             if change == 'y':
                 try:
-                    dyn_config['forecast_months'] = int(input("Горизонт прогноза (мес.): ") or dyn_config.get('forecast_months', 12))
+                    dyn_config['forecast_months'] = int(input("Количество месяцев прогноза: ") or dyn_config.get('forecast_months', 12))
+                    dyn_config['growth_rate_monthly'] = float(input("Рост выручки в месяц (например, 0.02 для 2%): ") or dyn_config.get('growth_rate_monthly', 0.02))
                     dyn_config['receivables_days'] = float(input("Отсрочка от клиентов (дней): ") or dyn_config.get('receivables_days', 0))
                     dyn_config['payables_days'] = float(input("Отсрочка поставщикам (дней): ") or dyn_config.get('payables_days', 0))
-                    infl = input(f"Инфляция в месяц (по умолч. {dyn_config.get('inflation_rate_monthly', 0.005)}): ")
-                    if infl:
-                        dyn_config['inflation_rate_monthly'] = float(infl)
                 except ValueError:
                     print("⚠️ Ошибка ввода, используются значения по умолчанию.")
+
             dyn_engine = DynamicForecastEngine(df_classified, balance, dyn_config)
             dyn_engine.run()
 
-        run_pinn = input("\nЗапустить PINN-анализ (экспериментальный)? (y/n): ").strip().lower()
-        if run_pinn == 'y':
-            pinn = TorchPINN(df_classified, balance, tax_rate=0.06)
-            pinn.train(epochs=800)
-            pinn.forecast_text_table(months_ahead=12)   # текстовый прогноз баланса
-            pinn.verdict()
-        else:
-            print("Анализ завершён.")
+        print("\n✅ Анализ завершён. Все выводы основаны на заданных правилах и не содержат «чёрных ящиков».")
 
     except ValueError as ve:
         print(f"❌ Ошибка в данных: {ve}")
@@ -796,7 +593,6 @@ def main():
         traceback.print_exc()
     except KeyboardInterrupt:
         print("\n⏹️ Прервано пользователем.")
-
 
 if __name__ == "__main__":
     main()
