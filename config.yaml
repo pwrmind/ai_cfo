@@ -1,0 +1,13 @@
+# Общие параметры для базовой симуляции
+scale_factor: 5.0
+fixed_exp_growth: 3.5
+
+# Параметры динамического прогноза
+dynamic_forecast:
+  forecast_months: 12
+  seasonality_profile: null   # или список из 12 коэффициентов, например [0.8, 0.7, ...]
+  inflation_rate_monthly: 0.005
+  receivables_days: 0         # средняя отсрочка платежа от клиентов (дней)
+  payables_days: 0            # средняя отсрочка платежа поставщикам (дней)
+  tax_payment_schedule: quarterly  # monthly, quarterly, annual
+  capex_monthly: 0            # ожидаемые ежемесячные капзатраты (если 0, берётся среднее из истории)
