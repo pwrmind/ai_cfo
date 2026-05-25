@@ -275,37 +275,69 @@ class AIClassifier:
 # МОДУЛЬ 3: СИМУЛЯТОР МАСШТАБИРОВАНИЯ БИЗНЕСА
 # ==========================================
 class ForecastEngine:
-    def __init__(self, dataframe, end_balance=None, tax_rate=0.06, scale_factor=5.0, fixed_exp_growth=3.5):
+    def __init__(self, dataframe, end_balance=None, tax_regime='income', custom_tax_rate=None,
+                 scale_factor=5.0, fixed_exp_growth=3.5):
         self.df = dataframe
-        self.end_balance = end_balance                      # реальный остаток из выписки (может быть None)
-        self.tax_rate = tax_rate                            # ставка налога (доля от выручки)
-        self.scale_factor = scale_factor                    # во сколько раз масштабируем выручку
-        self.fixed_exp_growth = fixed_exp_growth            # коэффициент нелинейного роста постоянных расходов
+        self.end_balance = end_balance
+        self.tax_regime = tax_regime          # 'income', 'profit', 'custom'
+        self.custom_tax_rate = custom_tax_rate  # используется при tax_regime='custom'
+        self.scale_factor = scale_factor
+        self.fixed_exp_growth = fixed_exp_growth
+
+    def _calculate_tax(self, income, expense, fixed, amort):
+        """Расчёт налога в зависимости от режима."""
+        if self.tax_regime == 'income':
+            # УСН Доходы 6%
+            rate = 0.06
+            tax = income * rate
+        elif self.tax_regime == 'profit':
+            # УСН Доходы минус расходы 15%
+            rate = 0.15
+            profit_before_tax = income - expense - fixed - amort
+            tax = max(0, profit_before_tax) * rate
+            # Минимальный налог 1% от дохода
+            min_tax = income * 0.01
+            tax = max(tax, min_tax)
+        elif self.tax_regime == 'custom' and self.custom_tax_rate is not None:
+            # Произвольная ставка от выручки
+            tax = income * self.custom_tax_rate
+        else:
+            tax = 0.0
+        return tax
 
     def run_simulation(self):
         print("\n" + "="*50)
         print(" СИМУЛЯЦИЯ МАСШТАБИРОВАНИЯ БИЗНЕСА ")
         print("="*50)
 
-        # Агрегация данных (безопасная, даже если каких-то категорий нет)
+        # Агрегация данных
         sums = self.df.groupby('Category')['Сумма'].sum()
         
         op_income = sums.get('OPERATING_INCOME', 0.0)
         op_expense = abs(sums.get('OPERATING_EXPENSE', 0.0))
         fixed_expense = abs(sums.get('FIXED_EXPENSE', 0.0))
         capex = abs(sums.get('CAPEX', 0.0))
-        fin_flow = sums.get('FINANCIAL_FLOW', 0.0)  # может быть и положительным, и отрицательным
         
+        # Разбивка финансовых потоков на приток и отток
+        fin_flow_df = self.df[self.df['Category'] == 'FINANCIAL_FLOW']['Сумма']
+        fin_inflow = fin_flow_df[fin_flow_df > 0].sum()
+        fin_outflow = fin_flow_df[fin_flow_df < 0].sum()
+        fin_net = fin_inflow + fin_outflow
+        
+        # Вывод фактических данных
         print(f"📊 ФАКТ (DATA):")
-        print(f"   Выручка (Revenue):    {op_income:,.2f} руб.")
-        print(f"   Переменные расходы:   {op_expense:,.2f} руб.")
-        print(f"   Постоянные расходы:   {fixed_expense:,.2f} руб.")
-        print(f"   Инвестиции (Capex):   {capex:,.2f} руб.")
-        print(f"   Финансовые потоки:    {fin_flow:,.2f} руб.")
+        print(f"   Выручка (Revenue):        {op_income:>12,.2f} руб.")
+        print(f"   Переменные расходы (COGS):{op_expense:>12,.2f} руб.")
+        print(f"   Постоянные расходы (Opex):{fixed_expense:>12,.2f} руб.")
+        print(f"   Инвестиции (Capex):       {capex:>12,.2f} руб.")
+        print(f"   Финансовые потоки:")
+        print(f"      Приток (поступления):  {fin_inflow:>12,.2f} руб.")
+        print(f"      Отток (переводы/изъятия):{fin_outflow:>12,.2f} руб.")
+        print(f"      Нетто-поток:           {fin_net:>12,.2f} руб.")
         if self.end_balance is not None:
-            print(f"   💰 Банковский остаток: {self.end_balance:,.2f} руб.")
+            print(f"   💰 Банковский остаток:    {self.end_balance:>12,.2f} руб.")
         else:
-            print(f"   💰 Банковский остаток: (неизвестен)")
+            print(f"   💰 Банковский остаток:    (неизвестен)")
         print(f"   -----------------------------------")
 
         # Юнит-экономика
@@ -313,6 +345,10 @@ class ForecastEngine:
         print(f"⚖️  ЮНИТ-ЭКОНОМИКА: {'✅ Положительная' if unit_profit > 0 else '❌ ОТРИЦАТЕЛЬНАЯ'}")
         if unit_profit < 0:
             print("   (!) Прямые расходы превышают выручку – базовый бизнес убыточен.")
+
+        # Фактический налог (для информации)
+        actual_tax = self._calculate_tax(op_income, op_expense, fixed_expense, capex/12)
+        print(f"   💼 Расчётный налог за период: {actual_tax:,.2f} руб. (режим: {self.tax_regime})")
 
         # Прогноз при масштабировании
         print(f"\n🚀 ПРОГНОЗ РОСТА (x{self.scale_factor}):")
@@ -323,26 +359,26 @@ class ForecastEngine:
         # Нелинейный рост постоянных расходов
         if fixed_expense == 0:
             print("   ⚠️ Постоянные расходы в отчётном периоде отсутствуют. В реальности они могут появиться.")
-            sim_fixed_expense = 0.0   # не подставляем жёсткие значения
+            sim_fixed_expense = 0.0
         else:
             sim_fixed_expense = fixed_expense * self.fixed_exp_growth
-        
-        # Налоги (упрощённо – с оборота, можно заменить на УСН "доходы минус расходы" при необходимости)
-        sim_tax = sim_income * self.tax_rate
         
         # Амортизация капитальных затрат (условно на 12 месяцев)
         sim_amortization = (capex * self.scale_factor) / 12
         
-        # Чистая прибыль
+        # Налог по выбранному режиму
+        sim_tax = self._calculate_tax(sim_income, sim_op_expense, sim_fixed_expense, sim_amortization)
+        
+        # Чистая прибыль (финансовые потоки не учитываем – это не операционная деятельность)
         sim_net_profit = sim_income - sim_op_expense - sim_fixed_expense - sim_tax - sim_amortization
 
-        print(f"   Прогноз выручки:       {sim_income:,.2f}")
-        print(f"   Переменные расходы:    {sim_op_expense:,.2f}")
-        print(f"   Постоянные расходы:    {sim_fixed_expense:,.2f} (x{self.fixed_exp_growth} от исходных)")
-        print(f"   Налоги (с выручки):    {sim_tax:,.2f}")
-        print(f"   Амортизация Capex:     {sim_amortization:,.2f}")
+        print(f"   Прогноз выручки:         {sim_income:>12,.2f}")
+        print(f"   Переменные расходы:      {sim_op_expense:>12,.2f}")
+        print(f"   Постоянные расходы:      {sim_fixed_expense:>12,.2f} (x{self.fixed_exp_growth} от исходных)")
+        print(f"   Налоги:                  {sim_tax:>12,.2f} ({self.tax_regime})")
+        print(f"   Амортизация Capex:       {sim_amortization:>12,.2f}")
         print(f"   -----------------------------------")
-        print(f"   📉 ПРОГНОЗ ПРИБЫЛИ:    {sim_net_profit:,.2f} руб.")
+        print(f"   📉 ПРОГНОЗ ПРИБЫЛИ:      {sim_net_profit:>12,.2f} руб.")
 
         return sim_net_profit
 
@@ -379,11 +415,31 @@ def print_classification_summary(df):
         print(f"   {cat:<25} {int(row['Количество']):>4} шт.   {row['Общая_сумма']:>12,.2f} руб.")
 
 
+def select_tax_regime():
+    """Интерактивный выбор налогового режима."""
+    print("\nВыберите налоговый режим:")
+    print("1 - УСН Доходы (6%)")
+    print("2 - УСН Доходы минус расходы (15%, но не менее 1% от выручки)")
+    print("3 - Другая ставка (указать вручную)")
+    choice = input("Введите номер режима (1-3, по умолчанию 1): ").strip()
+    if choice == '2':
+        return 'profit', None
+    elif choice == '3':
+        try:
+            rate = float(input("Введите ставку налога от выручки (например, 0.06 для 6%): "))
+            return 'custom', rate
+        except ValueError:
+            print("⚠️ Некорректная ставка. Будет использован режим УСН Доходы (6%).")
+            return 'income', None
+    else:
+        return 'income', None
+
+
 # ==========================================
 # ТОЧКА ВХОДА
 # ==========================================
 def main():
-    print("AI CFO v1.3 – Система анализа выписки 1С")
+    print("AI CFO v1.4 – Система анализа выписки 1С")
     user_path = input("Путь к файлу 1C (.txt): ").strip().strip('"')
     
     if not user_path or not os.path.exists(user_path):
@@ -413,11 +469,15 @@ def main():
         # Сводная статистика
         print_classification_summary(df_classified)
         
-        # 3. Симуляция масштабирования
+        # 3. Выбор налогового режима
+        tax_regime, custom_rate = select_tax_regime()
+        
+        # 4. Симуляция масштабирования
         engine = ForecastEngine(
             dataframe=df_classified,
             end_balance=balance,
-            tax_rate=0.06,
+            tax_regime=tax_regime,
+            custom_tax_rate=custom_rate,
             scale_factor=5.0,
             fixed_exp_growth=3.5
         )
