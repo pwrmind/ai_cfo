@@ -261,6 +261,7 @@ class AIClassifier:
         df['Category'] = results
         return df
 
+
 # ==========================================
 # МОДУЛЬ 3: БАЗОВАЯ СИМУЛЯЦИЯ (упрощённая)
 # ==========================================
@@ -417,7 +418,6 @@ class DynamicForecastEngine:
             season_factors = self.seasonality
             print("ℹ️ Используются заданные сезонные коэффициенты.")
         else:
-            # Подсчитываем количество месяцев с ненулевым доходом
             income_by_month = monthly['OPERATING_INCOME']
             positive_months = (income_by_month > 0).sum()
             if num_hist_months < 3 or positive_months < 3:
@@ -429,7 +429,6 @@ class DynamicForecastEngine:
                 season_factors = []
                 for m in range(1, 13):
                     val = season_income.get(m, avg_income)
-                    # Защита от отрицательных или нулевых значений
                     if val <= 0:
                         val = avg_income
                     factor = val / avg_income
@@ -529,36 +528,45 @@ class DynamicForecastEngine:
             print("\n✅ За весь период кассовых разрывов не ожидается.")
         return forecast_df
 
-# ==========================================
-# МОДУЛЬ 3: НАСТОЯЩИЙ PINN (PyTorch)
-# ==========================================
 
 # ==========================================
-# МОДУЛЬ 3: НАСТОЯЩИЙ PINN (PyTorch)
+# МОДУЛЬ 5: НАСТОЯЩИЙ PINN (PyTorch)
 # ==========================================
 class TorchPINN:
     def __init__(self, df, end_balance, tax_rate=0.06):
         self.df = df
         self.end_balance = end_balance
         self.tax_rate = tax_rate
+        self.growth_rate = None
         self.friction = None
         self.model = None
 
     def prepare_data(self):
-        """Строит временной ряд накопленного баланса, нормализует."""
-        df = self.df.sort_values('Дата_dt')
-        df['cumsum'] = df['Сумма'].cumsum()
-        # Начальный баланс (если выписка не с нуля, скорректируем)
+        """
+        Готовит временной ряд накопленного операционного баланса,
+        исключая финансовые потоки (категория FINANCIAL_FLOW).
+        """
+        df = self.df.sort_values('Дата_dt').copy()
+        # Исключаем финансовые потоки
+        df_op = df[df['Category'] != 'FINANCIAL_FLOW']
+        if df_op.empty:
+            # Если все транзакции оказались финансовыми потоками, берём все
+            df_op = df
+            print("⚠️ Внимание: все транзакции отнесены к финансовым потокам. Анализ может быть неинформативным.")
+
+        df_op['cumsum'] = df_op['Сумма'].cumsum()
+        # Восстанавливаем абсолютный баланс: конечный остаток минус сумма всех операционных транзакций + накопленный
         if self.end_balance is not None:
-            df['balance'] = self.end_balance - df['cumsum'].iloc[-1] + df['cumsum']
+            total_op_effect = df_op['cumsum'].iloc[-1]
+            df_op['balance'] = self.end_balance - total_op_effect + df_op['cumsum']
         else:
-            df['balance'] = df['cumsum'] - df['cumsum'].iloc[0]  # относительный рост
-        # Время в днях от первой транзакции
-        start_date = df['Дата_dt'].iloc[0]
-        df['days'] = (df['Дата_dt'] - start_date).dt.days
-        # Нормализация: время в [0,1], баланс в [0,1] (min-max)
-        t_raw = df['days'].values.astype(np.float32)
-        y_raw = df['balance'].values.astype(np.float32)
+            df_op['balance'] = df_op['cumsum'] - df_op['cumsum'].iloc[0]  # относительный
+
+        start_date = df_op['Дата_dt'].iloc[0]
+        df_op['days'] = (df_op['Дата_dt'] - start_date).dt.days
+        t_raw = df_op['days'].values.astype(np.float32)
+        y_raw = df_op['balance'].values.astype(np.float32)
+        # Нормализация времени и баланса
         t_norm = (t_raw - t_raw.min()) / (t_raw.max() - t_raw.min() + 1e-6)
         y_norm = (y_raw - y_raw.min()) / (y_raw.max() - y_raw.min() + 1e-6)
         self.t_data = torch.tensor(t_norm, dtype=torch.float32).view(-1, 1)
@@ -579,65 +587,77 @@ class TorchPINN:
         def forward(self, t):
             return self.net(t)
 
-    def physics_loss(self, model, t, friction):
+    def physics_loss(self, model, t, growth_rate, friction):
         balance = model(t)
         d_balance_dt = torch.autograd.grad(balance, t, torch.ones_like(balance), create_graph=True)[0]
-        # Уравнение: dBalance/dt = growth_rate - friction * balance^2
-        growth_rate = 1.0  # нормированная скорость при малом балансе
-        residual = d_balance_dt - (growth_rate - friction * balance**2)
+        # Логистическое уравнение: dB/dt = growth_rate * B - friction * B^2
+        residual = d_balance_dt - (growth_rate * balance - friction * balance**2)
         return torch.mean(residual**2)
 
     def train(self, epochs=1500):
         self.prepare_data()
-        self.friction = torch.tensor([0.5], requires_grad=True)
+        # Параметры, которые сеть сама отрегулирует
+        self.growth_rate = torch.tensor([0.5], requires_grad=True)
+        self.friction = torch.tensor([0.1], requires_grad=True)
         model = self.PINNModel()
-        optimizer = torch.optim.Adam(list(model.parameters()) + [self.friction], lr=0.01)
-        print("\nОбучение PINN... Ищем коэффициент неэффективности бизнеса...")
+        optimizer = torch.optim.Adam(list(model.parameters()) + [self.growth_rate, self.friction], lr=0.01)
+        print("\nОбучение PINN (логистическое уравнение)...")
+        print("Ищем внутреннюю скорость роста (r) и коэффициент трения (α).")
         for epoch in range(epochs):
             optimizer.zero_grad()
             y_pred = model(self.t_data)
             loss_data = torch.mean((y_pred - self.y_data)**2)
             t_physics = torch.linspace(0, 2, 30).view(-1, 1).requires_grad_(True)
-            loss_phys = self.physics_loss(model, t_physics, self.friction)
+            loss_phys = self.physics_loss(model, t_physics, self.growth_rate, self.friction)
             loss = loss_data + loss_phys
             loss.backward()
             optimizer.step()
             if epoch % 300 == 0:
-                print(f"Epoch {epoch:4d}: Friction={self.friction.item():.4f}, Loss={loss.item():.6f}")
-        self.model = model
-        self.friction_value = self.friction.item()
-        print(f"\nНайденный коэффициент трения (friction): {self.friction_value:.4f}")
+                print(f"Epoch {epoch:4d}: r={self.growth_rate.item():.4f}, α={self.friction.item():.4f}, Loss={loss.item():.6f}")
 
-    def predict_future(self, scale_months=12):
+        self.model = model
+        self.growth_rate_value = self.growth_rate.item()
+        self.friction_value = self.friction.item()
+        # Ёмкость рынка K = r / α (если friction > 0)
+        if self.friction_value > 1e-4:
+            K = self.growth_rate_value / self.friction_value
+            print(f"Предельный масштаб (K): {K:.3f} (в нормализованных единицах)")
+        else:
+            K = float('inf')
+        print(f"✅ Обучение завершено. r = {self.growth_rate_value:.4f}, α = {self.friction_value:.4f}")
+
+    def predict_future(self):
         if self.model is None:
             raise RuntimeError("Сначала обучите модель.")
         t_max = self.t_data.max().item()
-        t_future = torch.linspace(t_max, t_max * 2.0, 50).view(-1, 1)  # в 2 раза дальше по нормализованному времени
+        t_future = torch.linspace(t_max, t_max * 2.0, 50).view(-1, 1)
         with torch.no_grad():
             y_future_norm = self.model(t_future).numpy()
-        # Денормализация
         y_future = y_future_norm * (self.y_max - self.y_min) + self.y_min
-        # Восстановление временной шкалы (грубо)
         t_days_future = np.linspace(self.t_raw.max(), self.t_raw.max() * 2.0, 50)
         return t_days_future, y_future.flatten()
 
     def plot(self):
         t_days_future, y_future = self.predict_future()
         plt.figure(figsize=(10, 5))
-        plt.plot(self.t_raw, self.y_raw, 'bo-', label='Исторический баланс')
+        plt.plot(self.t_raw, self.y_raw, 'bo-', label='Операционный баланс (без фин.потоков)')
         plt.plot(t_days_future, y_future, 'r--', label='Прогноз PINN')
-        plt.xlabel('Дни')
+        plt.xlabel('Дни от первой транзакции')
         plt.ylabel('Баланс, руб.')
-        plt.title(f'Динамика баланса (friction={self.friction_value:.3f})')
+        plt.title(f'Логистический рост: r={self.growth_rate_value:.3f}, α={self.friction_value:.3f}')
         plt.legend()
         plt.grid(True)
         plt.show()
 
     def verdict(self):
         if self.friction_value > 0.5:
-            print("🛑 ВЫСОКОЕ ТРЕНИЕ. Масштабирование приведёт к остановке роста и кассовым разрывам.")
+            print("🛑 ВЫСОКОЕ ВНУТРЕННЕЕ ТРЕНИЕ. Рост сильно ограничен.")
+            print("   Рекомендация: искать структурные причины неэффективности.")
+        elif self.growth_rate_value < 0.2:
+            print("⚠️ НИЗКАЯ БАЗОВАЯ СКОРОСТЬ РОСТА. Даже без трения бизнес растёт медленно.")
         else:
-            print("✅ Низкое трение. Бизнес-модель масштабируема.")
+            print("✅ ЗДОРОВАЯ ДИНАМИКА. Параметры роста благоприятные.")
+
 
 # ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -724,13 +744,10 @@ def main():
         # 5. Динамический прогноз (опционально)
         run_dynamic = input("\nЗапустить динамический прогноз с учётом сезонности, дебиторки и кассовых разрывов? (y/n): ").strip().lower()
         if run_dynamic == 'y':
-            # Загружаем параметры из конфига, но можно переопределить
             dyn_config = config.get('dynamic_forecast', {})
-            # Добавляем налоговый режим
             dyn_config['tax_regime'] = tax_regime
             dyn_config['custom_tax_rate'] = custom_rate
 
-            # Опционально спрашиваем, не хочет ли пользователь изменить параметры
             print("\nТекущие параметры динамического прогноза (из config.yaml):")
             for k, v in dyn_config.items():
                 print(f"  {k}: {v}")
@@ -743,7 +760,6 @@ def main():
                     infl = input(f"Инфляция в месяц (по умолч. {dyn_config.get('inflation_rate_monthly', 0.005)}): ")
                     if infl:
                         dyn_config['inflation_rate_monthly'] = float(infl)
-                    # сезонность оставим из конфига, либо спросим 12 чисел
                     print("Сезонность оставлена из config.yaml (или автоопределение, если не задана).")
                 except ValueError:
                     print("⚠️ Ошибка ввода, используются значения по умолчанию.")
