@@ -158,8 +158,11 @@ class AIClassifier:
         self.keyword_map = {
             "OPERATING_INCOME": ["выручк", "оплат", "поступлен", "эквайринг", "доход"],
             "OPERATING_EXPENSE": ["закупк", "товар", "логистик", "комисси", "хозтовар", "гсм", "материал", "канцеляр"],
-            "FIXED_EXPENSE": ["аренд", "зарплат", "бухгалтер", "интернет", "налог", "sms", "связ", "коммунальн",
-                              "обслуживание счета", "ведение счета"],
+            "FIXED_EXPENSE": [
+                "аренд", "зарплат", "бухгалтер", "интернет", "налог", "sms", "связ", "коммунальн",
+                "обслуживание счета", "ведение счета",
+                "ндфл", "алимент", "исполнительный лист", "страховые взносы", "пфр", "фсс", "штраф", "пеня"
+            ],
             "CAPEX": ["оборудован", "компьютер", "мебел", "автомобил", "основных средств"],
             "FINANCIAL_FLOW": ["взнос наличных", "перевод собственных средств", "пополнение счета",
                                "уставный капитал", "займ", "кредит", "card2card", "corpcards", "p2p"]
@@ -192,21 +195,34 @@ class AIClassifier:
         if df.empty:
             df['Category'] = []
             return df
+
         results = []
         for idx, row in df.iterrows():
             txt = row['Назначение']
             amount = row['Сумма']
+
+            # 0. Явные паттерны (детерминированные правила)
             if re.search(r'CARD2CARD|CORPCARDS|P2P', txt, re.IGNORECASE):
                 results.append("FINANCIAL_FLOW")
                 continue
+            # Обязательные платежи, связанные с персоналом, налоги/взносы
+            if re.search(r'алимент|ндфл|страховые взносы|пфр|фсс|исполнительный лист|штраф|пеня|налог на имущество|транспортный налог',
+                         txt, re.IGNORECASE):
+                results.append("FIXED_EXPENSE")
+                continue
+
+            # A. Проверка MCC
             mcc = self.get_mcc(txt)
             if mcc and mcc in self.mcc_codes:
                 results.append(self.mcc_codes[mcc])
                 continue
+
+            # B. Семантический анализ
             cleaned = self.clean_text(txt)
             if len(cleaned) < 3:
                 results.append("OPERATING_EXPENSE" if amount < 0 else "OTHER")
                 continue
+
             category = None
             if self.use_ai:
                 vec = self.model.encode(cleaned)
@@ -217,16 +233,30 @@ class AIClassifier:
                     if sim > max_sim:
                         max_sim = sim
                         best_cat = cat
-                if best_cat != "OTHER" and max_sim > 0.30:
+                # Если модель определила как доход, но сумма отрицательная -> сомнительно, перепроверим ключевыми словами
+                if best_cat == "OPERATING_INCOME" and amount < 0:
+                    # Попробуем найти более подходящую категорию через ключевые слова
+                    fallback = self._classify_by_keywords(cleaned)
+                    if fallback and fallback != "OPERATING_INCOME":
+                        category = fallback
+                    else:
+                        category = "OPERATING_EXPENSE"  # безопасное предположение
+                elif best_cat != "OTHER" and max_sim > 0.30:
                     category = best_cat
+
             if category is None:
                 category = self._classify_by_keywords(cleaned)
             if category is None:
                 category = "OTHER"
+
+            # Дополнительная проверка: если по-прежнему доход, а сумма отрицательная, меняем на расход
+            if category == "OPERATING_INCOME" and amount < 0:
+                category = "OPERATING_EXPENSE"
+
             results.append(category)
+
         df['Category'] = results
         return df
-
 
 # ==========================================
 # МОДУЛЬ 3: БАЗОВАЯ СИМУЛЯЦИЯ (упрощённая)
