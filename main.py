@@ -121,11 +121,11 @@ class BankParser:
 
 
 # ==========================================
-# МОДУЛЬ 2: ГИБРИДНЫЙ КЛАССИФИКАТОР (REGEX + MCC + AI)
+# МОДУЛЬ 2: ГИБРИДНЫЙ КЛАССИФИКАТОР (REGEX + MCC + AI + KEYWORDS)
 # ==========================================
 class AIClassifier:
-    def __init__(self, model_name="sentence-transformers/LaBSE"):
-        print(f"\n[Система] Инициализация гибридного мозга (MCC + {model_name})...")
+    def __init__(self, model_name="cointegrated/rubert-tiny2"):
+        print(f"\n[Система] Инициализация гибридного мозга (MCC + {model_name} + keywords)...")
         self.model = None
         self.use_ai = False
         try:
@@ -151,11 +151,15 @@ class AIClassifier:
             "5499": "OPERATING_EXPENSE"
         }
 
-        # 2. СЕМАНТИЧЕСКИЕ ЯКОРЯ (используются, если модель доступна)
+        # 2. СЕМАНТИЧЕСКИЕ ЯКОРЯ (только если модель доступна)
         self.categories = {
             "OPERATING_INCOME": ["Оплата от клиента", "Поступление выручки", "Розничная выручка", "Оплата по счету"],
-            "OPERATING_EXPENSE": ["Закупка товара", "Логистика", "Комиссия банка", "Хозтовары", "Материалы", "ГСМ"],
-            "FIXED_EXPENSE": ["Аренда офиса", "Зарплата", "Бухгалтерия", "Интернет", "Налоги", "SMS информирование"],
+            "OPERATING_EXPENSE": ["Закупка товара", "Логистика", "Комиссия банка", "Хозтовары", "Материалы", "ГСМ", "сырьё"],
+            "FIXED_EXPENSE": [
+                "Аренда офиса", "Зарплата", "Бухгалтерия", "Интернет", "Налоги",
+                "SMS информирование", "SMS-оповещение", "Комиссия за обслуживание счета",
+                "Банковская комиссия за ведение счета", "Плата за ведение счета"
+            ],
             "CAPEX": ["Покупка оборудования", "Компьютеры", "Мебель", "Автомобиль", "Основные средства"],
             "FINANCIAL_FLOW": ["Взнос наличных", "Перевод собственных средств", "Пополнение счета", "Уставный капитал", "Займ"]
         }
@@ -166,15 +170,17 @@ class AIClassifier:
             for cat, texts in self.categories.items():
                 self.anchors[cat] = np.mean(self.model.encode(texts), axis=0)
             print("[Система] Калибровка завершена.   ")
-        else:
-            # Простой словарь ключевых слов для fallback-режима
-            self.keyword_map = {
-                "OPERATING_INCOME": ["выручк", "оплат", "поступлен", "эквайринг", "доход"],
-                "OPERATING_EXPENSE": ["закупк", "товар", "логистик", "комисси", "хозтовар", "гсм", "материал", "канцеляр"],
-                "FIXED_EXPENSE": ["аренд", "зарплат", "бухгалтер", "интернет", "налог", "sms", "связ", "коммунальн"],
-                "CAPEX": ["оборудован", "компьютер", "мебел", "автомобил", "основных средств"],
-                "FINANCIAL_FLOW": ["взнос наличных", "перевод собственных средств", "пополнение счета", "уставный капитал", "займ", "кредит"]
-            }
+        
+        # 3. Резервная карта ключевых слов (используется всегда, если AI не сработал или отсутствует)
+        self.keyword_map = {
+            "OPERATING_INCOME": ["выручк", "оплат", "поступлен", "эквайринг", "доход"],
+            "OPERATING_EXPENSE": ["закупк", "товар", "логистик", "комисси", "хозтовар", "гсм", "материал", "канцеляр"],
+            "FIXED_EXPENSE": ["аренд", "зарплат", "бухгалтер", "интернет", "налог", "sms", "связ", "коммунальн",
+                              "обслуживание счета", "ведение счета"],
+            "CAPEX": ["оборудован", "компьютер", "мебел", "автомобил", "основных средств"],
+            "FINANCIAL_FLOW": ["взнос наличных", "перевод собственных средств", "пополнение счета",
+                               "уставный капитал", "займ", "кредит", "card2card", "corpcards", "p2p"]
+        }
 
     def clean_text(self, text):
         """Удаляет технический мусор, оставляя смысловую часть"""
@@ -196,6 +202,13 @@ class AIClassifier:
         match = re.search(r'MCC[:\s]*(\d{4})', text, re.IGNORECASE)
         return match.group(1) if match else None
 
+    def _classify_by_keywords(self, cleaned_text):
+        """Поиск категории по вхождению ключевых слов (fallback)."""
+        for cat, keywords in self.keyword_map.items():
+            if any(kw in cleaned_text.lower() for kw in keywords):
+                return cat
+        return None
+
     def classify(self, df):
         """Классифицирует транзакции, добавляет столбец 'Category'"""
         print("[Система] Классификация транзакций...")
@@ -207,13 +220,18 @@ class AIClassifier:
         for idx, row in df.iterrows():
             txt = row['Назначение']
             amount = row['Сумма']
-            
+
+            # 0. Явные паттерны (детерминированные правила)
+            if re.search(r'CARD2CARD|CORPCARDS|P2P', txt, re.IGNORECASE):
+                results.append("FINANCIAL_FLOW")
+                continue
+
             # A. Проверка MCC (золотой стандарт)
             mcc = self.get_mcc(txt)
             if mcc and mcc in self.mcc_codes:
                 results.append(self.mcc_codes[mcc])
                 continue
-            
+
             # B. Семантический анализ (ИИ или ключевые слова)
             cleaned = self.clean_text(txt)
             if len(cleaned) < 3:
@@ -224,8 +242,10 @@ class AIClassifier:
                     results.append("OTHER")
                 continue
 
+            category = None
+
+            # B1. Основной путь: SentenceTransformer (если доступен)
             if self.use_ai:
-                # Вариант с моделью
                 vec = self.model.encode(cleaned)
                 best_cat = "OTHER"
                 max_sim = -1
@@ -234,18 +254,19 @@ class AIClassifier:
                     if sim > max_sim:
                         max_sim = sim
                         best_cat = cat
-                results.append(best_cat if max_sim > 0.30 else "OTHER")
-            else:
-                # Fallback: поиск ключевых слов
-                found = False
-                for cat, keywords in self.keyword_map.items():
-                    if any(kw in cleaned.lower() for kw in keywords):
-                        results.append(cat)
-                        found = True
-                        break
-                if not found:
-                    results.append("OTHER")
-        
+                if best_cat != "OTHER" and max_sim > 0.30:
+                    category = best_cat
+
+            # B2. Если AI не дал уверенного ответа (или отсутствует), пробуем ключевые слова
+            if category is None:
+                category = self._classify_by_keywords(cleaned)
+
+            # B3. Если всё ещё не определили — OTHER
+            if category is None:
+                category = "OTHER"
+
+            results.append(category)
+
         df['Category'] = results
         return df
 
@@ -362,7 +383,7 @@ def print_classification_summary(df):
 # ТОЧКА ВХОДА
 # ==========================================
 def main():
-    print("AI CFO v1.2 – Система анализа выписки 1С")
+    print("AI CFO v1.3 – Система анализа выписки 1С")
     user_path = input("Путь к файлу 1C (.txt): ").strip().strip('"')
     
     if not user_path or not os.path.exists(user_path):
