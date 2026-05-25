@@ -4,10 +4,13 @@ import sys
 import yaml
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
 
 # ==========================================
 # МОДУЛЬ 1: ПАРСЕР ФОРМАТА 1C (ГЛАЗА СИСТЕМЫ)
@@ -527,6 +530,116 @@ class DynamicForecastEngine:
         return forecast_df
 
 # ==========================================
+# МОДУЛЬ 3: НАСТОЯЩИЙ PINN (PyTorch)
+# ==========================================
+
+# ==========================================
+# МОДУЛЬ 3: НАСТОЯЩИЙ PINN (PyTorch)
+# ==========================================
+class TorchPINN:
+    def __init__(self, df, end_balance, tax_rate=0.06):
+        self.df = df
+        self.end_balance = end_balance
+        self.tax_rate = tax_rate
+        self.friction = None
+        self.model = None
+
+    def prepare_data(self):
+        """Строит временной ряд накопленного баланса, нормализует."""
+        df = self.df.sort_values('Дата_dt')
+        df['cumsum'] = df['Сумма'].cumsum()
+        # Начальный баланс (если выписка не с нуля, скорректируем)
+        if self.end_balance is not None:
+            df['balance'] = self.end_balance - df['cumsum'].iloc[-1] + df['cumsum']
+        else:
+            df['balance'] = df['cumsum'] - df['cumsum'].iloc[0]  # относительный рост
+        # Время в днях от первой транзакции
+        start_date = df['Дата_dt'].iloc[0]
+        df['days'] = (df['Дата_dt'] - start_date).dt.days
+        # Нормализация: время в [0,1], баланс в [0,1] (min-max)
+        t_raw = df['days'].values.astype(np.float32)
+        y_raw = df['balance'].values.astype(np.float32)
+        t_norm = (t_raw - t_raw.min()) / (t_raw.max() - t_raw.min() + 1e-6)
+        y_norm = (y_raw - y_raw.min()) / (y_raw.max() - y_raw.min() + 1e-6)
+        self.t_data = torch.tensor(t_norm, dtype=torch.float32).view(-1, 1)
+        self.y_data = torch.tensor(y_norm, dtype=torch.float32).view(-1, 1)
+        self.t_raw = t_raw
+        self.y_raw = y_raw
+        self.y_min = y_raw.min()
+        self.y_max = y_raw.max()
+
+    class PINNModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(1, 20), nn.Tanh(),
+                nn.Linear(20, 20), nn.Tanh(),
+                nn.Linear(20, 1)
+            )
+        def forward(self, t):
+            return self.net(t)
+
+    def physics_loss(self, model, t, friction):
+        balance = model(t)
+        d_balance_dt = torch.autograd.grad(balance, t, torch.ones_like(balance), create_graph=True)[0]
+        # Уравнение: dBalance/dt = growth_rate - friction * balance^2
+        growth_rate = 1.0  # нормированная скорость при малом балансе
+        residual = d_balance_dt - (growth_rate - friction * balance**2)
+        return torch.mean(residual**2)
+
+    def train(self, epochs=1500):
+        self.prepare_data()
+        self.friction = torch.tensor([0.5], requires_grad=True)
+        model = self.PINNModel()
+        optimizer = torch.optim.Adam(list(model.parameters()) + [self.friction], lr=0.01)
+        print("\nОбучение PINN... Ищем коэффициент неэффективности бизнеса...")
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            y_pred = model(self.t_data)
+            loss_data = torch.mean((y_pred - self.y_data)**2)
+            t_physics = torch.linspace(0, 2, 30).view(-1, 1).requires_grad_(True)
+            loss_phys = self.physics_loss(model, t_physics, self.friction)
+            loss = loss_data + loss_phys
+            loss.backward()
+            optimizer.step()
+            if epoch % 300 == 0:
+                print(f"Epoch {epoch:4d}: Friction={self.friction.item():.4f}, Loss={loss.item():.6f}")
+        self.model = model
+        self.friction_value = self.friction.item()
+        print(f"\nНайденный коэффициент трения (friction): {self.friction_value:.4f}")
+
+    def predict_future(self, scale_months=12):
+        if self.model is None:
+            raise RuntimeError("Сначала обучите модель.")
+        t_max = self.t_data.max().item()
+        t_future = torch.linspace(t_max, t_max * 2.0, 50).view(-1, 1)  # в 2 раза дальше по нормализованному времени
+        with torch.no_grad():
+            y_future_norm = self.model(t_future).numpy()
+        # Денормализация
+        y_future = y_future_norm * (self.y_max - self.y_min) + self.y_min
+        # Восстановление временной шкалы (грубо)
+        t_days_future = np.linspace(self.t_raw.max(), self.t_raw.max() * 2.0, 50)
+        return t_days_future, y_future.flatten()
+
+    def plot(self):
+        t_days_future, y_future = self.predict_future()
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.t_raw, self.y_raw, 'bo-', label='Исторический баланс')
+        plt.plot(t_days_future, y_future, 'r--', label='Прогноз PINN')
+        plt.xlabel('Дни')
+        plt.ylabel('Баланс, руб.')
+        plt.title(f'Динамика баланса (friction={self.friction_value:.3f})')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    def verdict(self):
+        if self.friction_value > 0.5:
+            print("🛑 ВЫСОКОЕ ТРЕНИЕ. Масштабирование приведёт к остановке роста и кассовым разрывам.")
+        else:
+            print("✅ Низкое трение. Бизнес-модель масштабируема.")
+
+# ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def load_config(filepath='config.yaml'):
@@ -637,6 +750,15 @@ def main():
 
             dyn_engine = DynamicForecastEngine(df_classified, balance, dyn_config)
             dyn_engine.run()
+
+        run_pinn = input("\nЗапустить PINN-анализ (требуется PyTorch)? (y/n): ").strip().lower()
+        if run_pinn == 'y':
+            pinn = TorchPINN(df_classified, balance, tax_rate=0.06)
+            pinn.train(epochs=1500)
+            pinn.plot()
+            pinn.verdict()
+        else:
+            print("Анализ завершён.")
 
     except ValueError as ve:
         print(f"❌ Ошибка в данных: {ve}")
